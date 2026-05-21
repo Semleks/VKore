@@ -36,8 +36,6 @@ public class VkSession
                 SubscribersCount = myProfile.FollowersCount ?? 0,
                 FriendsCount = myProfile.Counters?.Friends ?? 0
             };
-            
-            Logger.Logger.Log($"Привет, {Me.FirstName} {Me.LastName}!", 1);
         } 
         else
         {

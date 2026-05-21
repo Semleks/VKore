@@ -1,29 +1,32 @@
 namespace VKore.Logger;
 
+public enum LogType
+{
+    System,
+    Debug,
+    Warning,
+    Error
+}
+
 public class Logger
 {
-    
-    
-    public static void Log(string message, int status)
+    public static void Log(string message, LogType type)
     {
-        var statusString = "";
-
-        switch (status)
+        var originalColor = Console.ForegroundColor;
+        
+        Console.ForegroundColor = type switch
         {
-            case 0:
-                statusString = "System";
-                break;
-            case 1:
-                statusString = "Debug";
-                break;
-            case 2:
-                statusString = "Warning";
-                break;
-            case 3:
-                statusString = "Error";
-                break;
-        }
+            LogType.System => ConsoleColor.Cyan,
+            LogType.Debug => ConsoleColor.DarkGray,
+            LogType.Warning => ConsoleColor.Yellow,
+            LogType.Error => ConsoleColor.Red,
+            _ => ConsoleColor.White
+        };
 
-        Console.WriteLine($"[{statusString}] {DateTime.Now}: {message}");
+        var time = DateTime.Now.ToString("HH:mm:ss");
+        
+        Console.WriteLine($"[{type}] {time}: {message}");
+
+        Console.ForegroundColor = originalColor;
     }
 }
