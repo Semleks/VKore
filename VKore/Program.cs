@@ -67,7 +67,7 @@ class Program
 
                 case 5:
                     Console.Clear();
-                    await MessageMonitor.StartAsync(vkSession.Api);
+                    
                     Logger.Log("=== Запуск сессии ===", LogType.System);
                     Logger.Log($"Привет, {vkSession.Me.FirstName} {vkSession.Me.LastName}!", LogType.Warning);
                     
@@ -85,6 +85,7 @@ class Program
                         Logger.Log("ИИ-комментарии включены.", LogType.Debug);
                     }
 
+                    await MessageMonitor.StartAsync(vkSession.Api);
                     Console.ReadKey();
                     break;
 
