@@ -1,0 +1,13 @@
+.env
+VK_API_KEY.env
+*.env
+appsettings.Development.json
+
+[Bb]in/
+[Oo]bj/
+
+.idea/
+*.user
+*.suo
+
+*.log
