@@ -1,19 +1,18 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <RootNamespace>VKore</RootNamespace>
     </PropertyGroup>
 
     <ItemGroup>
-      <Folder Include="AI\" />
-    </ItemGroup>
-
-    <ItemGroup>
-      <PackageReference Include="dotenv.net" Version="4.0.2" />
-      <PackageReference Include="VkNet" Version="1.79.0-alpha-138" />
+        <PackageReference Include="dotenv.net"   Version="4.0.2" />
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+        <PackageReference Include="Telegram.Bot" Version="22.10.0.1" />
+        <PackageReference Include="VkNet"        Version="1.79.0-alpha-138" />
     </ItemGroup>
 
 </Project>

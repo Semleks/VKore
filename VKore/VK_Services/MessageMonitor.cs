@@ -1,241 +1,180 @@
-using System;
 using System.Collections.Concurrent;
-using System.Linq;
-using System.Net.Http;
-using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
-using VkNet;
-using VkNet.Model;
-using VKore.Logger;
-using VKore.Options;
-using VKore.System;
+using Telegram.Bot;
+using Telegram.Bot.Types.Enums;
+using VKore.Core;
+using VKore.Infrastructure.Logging;
 
 namespace VKore.VK_Services;
 
 public class MessageMonitor
 {
-    private static readonly ConcurrentDictionary<long, SavedMessage> MessageCache = new();
-    private static readonly ConcurrentDictionary<long, string> NameCache = new();
-    
-    private static readonly HttpClient HttpClient = new() { Timeout = TimeSpan.FromSeconds(35) };
+    private readonly BotContext _ctx;
+    private readonly ITelegramBotClient _tg;
 
-    public struct SavedMessage
+    private readonly ConcurrentDictionary<long, CachedMsg> _cache = new();
+    private readonly ConcurrentDictionary<long, string> _names = new();
+
+    private static readonly HttpClient _http = new()
     {
-        public long MessageId { get; set; }
-        public long PeerId { get; set; }
-        public long SenderId { get; set; }
-        public string SenderName { get; set; }
-        public string Text { get; set; }
-        public DateTime Timestamp { get; set; }
+        Timeout = TimeSpan.FromSeconds(35),
+        DefaultRequestHeaders = { { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VKore/1.0" } }
+    };
+
+    private record CachedMsg(long Id, long SenderId, string SenderName, string Text, DateTime At);
+
+    public MessageMonitor(BotContext ctx, ITelegramBotClient tg)
+    {
+        _ctx = ctx;
+        _tg  = tg;
     }
 
-    public static async Task StartAsync(VkApi api)
+    public async Task RunAsync(CancellationToken ct)
     {
-        Logger.Logger.Log("Инициализация службы безопасного отслеживания сообщений (LongPoll)...", LogType.System);
-        Logger.Logger.Log("Для выхода нажмите Ctrl + C.", LogType.Warning);
+        AppLogger.Log("LongPoll: инициализация...");
 
+        var lp     = _ctx.VkApi.Messages.GetLongPollServer(needPts: false, lpVersion: 3u);
+        var ts     = lp.Ts.ToString();
+        var key    = lp.Key;
+        var server = FixServer(lp.Server);
+
+        AppLogger.Log("LongPoll: подключён, жду события.");
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var url  = $"{server}?act=a_check&key={key}&ts={ts}&wait=25&mode=2&version=3";
+                var raw  = await _http.GetStringAsync(url, ct);
+                var json = JObject.Parse(raw);
+
+                if (json["failed"] is { } err)
+                {
+                    if (err.Value<int>() == 1)
+                        ts = json["ts"]?.Value<string>() ?? ts;
+                    else
+                    {
+                        var fresh = _ctx.VkApi.Messages.GetLongPollServer(needPts: false, lpVersion: 3u);
+                        ts = fresh.Ts.ToString(); key = fresh.Key; server = FixServer(fresh.Server);
+                    }
+                    continue;
+                }
+
+                ts = json["ts"]?.Value<string>() ?? ts;
+
+                if (json["updates"] is not JArray updates) continue;
+
+                foreach (var ev in updates)
+                    await HandleEvent(ev, ct);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (HttpRequestException) { await Task.Delay(5000, ct); }
+            catch (Exception ex)
+            {
+                AppLogger.Log($"LongPoll: {ex.Message}", LogType.Warning);
+                await Task.Delay(2000, ct);
+            }
+        }
+    }
+
+    private async Task HandleEvent(JToken ev, CancellationToken ct)
+    {
+        int code = ev[0]?.Value<int>() ?? -1;
+
+        if (code == 4) // новое сообщение
+        {
+            var msgId  = ev[1]!.Value<long>();
+            var flags  = ev[2]!.Value<int>();
+            var peerId = ev[3]!.Value<long>();
+            var text   = ev[5]!.Value<string>() ?? string.Empty;
+
+            if ((flags & 2) != 0) return; // пропускаем свои
+
+            var senderId = peerId;
+            if (peerId > 2_000_000_000 && ev[6] is JObject extra && extra["from"] != null)
+                senderId = extra["from"]!.Value<long>();
+
+            var name = await ResolveName(senderId);
+            _cache[msgId] = new CachedMsg(msgId, senderId, name, text, DateTime.UtcNow);
+
+            AppLogger.Log($"💬 {name}: {text}", LogType.System);
+            TrimCache();
+
+            if (_ctx.Config.NotifyOnNewMessages)
+                await Notify($"📬 *Новое сообщение*\n👤 *{Esc(name)}*\n💬 {Esc(text)}", ct);
+        }
+        else if (code == 2)
+        {
+            var msgId = ev[1]!.Value<long>();
+            var flagsSet = ev[2]!.Value<int>();
+
+            // флаг 128 = сообщение удалено
+            if ((flagsSet & 128) == 0) return;
+            if (!_cache.TryRemove(msgId, out var m)) return;
+
+            AppLogger.Log($"🚨 Удалено от {m.SenderName}: {m.Text}", LogType.Warning);
+
+            if (_ctx.Config.NotifyOnDeletedMessages)
+                await Notify($"🚨 *Удалённое сообщение*\n👤 *{Esc(m.SenderName)}*\n💬 {Esc(m.Text)}", ct);
+        }
+    }
+
+    private async Task Notify(string text, CancellationToken ct)
+    {
         try
         {
-            var lpServer = api.Messages.GetLongPollServer(needPts: false, lpVersion: 3u);
-            
-            string ts = lpServer.Ts.ToString();
-            string key = lpServer.Key;
-            string server = lpServer.Server;
-            
-            if (!server.StartsWith("http"))
-            {
-                server = "https://" + server;
-            }
-
-            Logger.Logger.Log("Наблюдатель сообщений успешно запущен через HTTP-туннель!", LogType.System);
-
-            while (true)
-            {
-                try
-                {
-                    var url = $"{server}?act=a_check&key={key}&ts={ts}&wait=25&mode=2&version=3";
-                    
-                    var responseString = await HttpClient.GetStringAsync(url);
-                    var json = JObject.Parse(responseString);
-
-                    if (json["failed"] != null)
-                    {
-                        int failed = json["failed"].Value<int>();
-                        if (failed == 1)
-                        {
-                            ts = json["ts"]?.Value<string>() ?? ts;
-                        }
-                        else
-                        {
-                            var newLp = api.Messages.GetLongPollServer(needPts: false, lpVersion: 3u);
-                            ts = newLp.Ts.ToString();
-                            key = newLp.Key;
-                            server = newLp.Server;
-                            if (!server.StartsWith("http")) server = "https://" + server;
-                        }
-                        continue;
-                    }
-
-                    ts = json["ts"]?.Value<string>() ?? ts;
-                    var updates = json["updates"] as JArray;
-
-                    if (updates == null) continue;
-
-                    foreach (var update in updates)
-                    {
-                        var eventCode = update[0].Value<int>();
-
-                        switch (eventCode)
-                        {
-                            case 4:
-                            {
-                                var messageId = update[1].Value<long>();
-                                var flags = update[2].Value<int>();
-                                var peerId = update[3].Value<long>();
-                                var timestamp = update[4].Value<long>();
-                                var text = update[5].Value<string>();
-
-                                var isIncoming = (flags & 2) == 0;
-                                if (isIncoming)
-                                {
-                                    var senderId = peerId;
-                                    var attachments = update[6] as JObject;
-                                
-                                    if (peerId > 2000000000 && attachments != null && attachments["from"] != null)
-                                    {
-                                        senderId = attachments["from"].Value<long>();
-                                    }
-
-                                    var senderName = await GetSenderNameSafeAsync(api, senderId);
-
-                                    var savedMsg = new SavedMessage
-                                    {
-                                        MessageId = messageId,
-                                        PeerId = peerId,
-                                        SenderId = senderId,
-                                        SenderName = senderName,
-                                        Text = text,
-                                        Timestamp = DateTime.UtcNow
-                                    };
-
-                                    MessageCache[messageId] = savedMsg;
-
-                                    Logger.Logger.Log($"Новое сообщение от {senderName}: {text}", LogType.System);
-
-                                    if (AccountOptions.TelegramForwardingEnabled)
-                                    {
-                                        var tgMsg = $"📬 *Новое сообщение в VK*\n\n" +
-                                                    $"👤 *Отправитель:* {senderName}\n" +
-                                                    $"💬 *Текст:* {text}";
-
-                                        await TelegramService.SendMessageAsync(
-                                            AccountOptions.TelegramBotToken,
-                                            AccountOptions.TelegramChatId,
-                                            tgMsg
-                                        );
-                                    }
-
-                                    PruneCache();
-                                }
-
-                                break;
-                            }
-                            case 2:
-                            {
-                                long messageId = update[1].Value<long>();
-                                int flagsSet = update[2].Value<int>();
-
-                                if ((flagsSet & 128) != 0)
-                                {
-                                    if (MessageCache.TryRemove(messageId, out var deletedMsg))
-                                    {
-                                        var consoleLog = $"🚨 ПОЛЬЗОВАТЕЛЬ {deletedMsg.SenderName} (ID: {deletedMsg.SenderId}) УДАЛИЛ СООБЩЕНИЕ: {deletedMsg.Text}";
-                                        Logger.Logger.Log(consoleLog, LogType.Warning);
-
-                                        if (AccountOptions.TelegramForwardingEnabled)
-                                        {
-                                            var tgMsg = $"🚨 *Удалённое сообщение!*\n\n" +
-                                                        $"👤 *Отправитель:* {deletedMsg.SenderName} (ID: {deletedMsg.SenderId})\n" +
-                                                        $"💬 *Текст:* {deletedMsg.Text}";
-
-                                            await TelegramService.SendMessageAsync(
-                                                AccountOptions.TelegramBotToken,
-                                                AccountOptions.TelegramChatId,
-                                                tgMsg
-                                            );
-                                        }
-                                    }
-                                }
-
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex) when (ex is HttpRequestException || ex is TaskCanceledException)
-                {
-                    await Task.Delay(5000);
-                }
-            }
+            await _tg.SendMessage(_ctx.Config.TelegramUserId, text,
+                parseMode: ParseMode.Markdown, cancellationToken: ct);
         }
         catch (Exception ex)
         {
-            Logger.Logger.Log($"Критическая ошибка наблюдателя сообщений: {ex.Message}", LogType.Error);
-            Console.ReadKey();
+            AppLogger.Log($"[TG] Ошибка отправки: {ex.Message}", LogType.Warning);
         }
     }
-    
-    private static async Task<string> GetSenderNameSafeAsync(VkApi api, long senderId)
-    {
-        if (NameCache.TryGetValue(senderId, out var cachedName))
-            return cachedName;
 
-        var name = $"ID: {senderId}";
+    private async Task<string> ResolveName(long id)
+    {
+        if (_names.TryGetValue(id, out var cached)) return cached;
+
         try
         {
-            if (senderId < 0)
+            string name;
+            if (id < 0)
             {
-                var groupId = Math.Abs(senderId);
-            
-                var groups = await api.Groups.GetByIdAsync(null, groupId.ToString(), null);
-                if (groups != null && groups.Count > 0)
-                {
-                    name = groups[0].Name;
-                    NameCache[senderId] = name;
-                }
+                var g = await _ctx.VkApi.Groups.GetByIdAsync(null, Math.Abs(id).ToString(), null);
+                name = g?.FirstOrDefault()?.Name ?? $"id{id}";
             }
             else
             {
-                var users = await api.Users.GetAsync(new[] { senderId });
-                if (users != null && users.Count > 0)
-                {
-                    name = $"{users[0].FirstName} {users[0].LastName}";
-                    NameCache[senderId] = name;
-                }
+                var u = await _ctx.VkApi.Users.GetAsync(new[] { id });
+                var user = u?.FirstOrDefault();
+                name = user != null ? $"{user.FirstName} {user.LastName}" : $"id{id}";
             }
+
+            _names[id] = name;
+            return name;
         }
         catch
         {
-            // ignored
+            return $"id{id}";
         }
-
-        return name;
     }
-    
-    private static void PruneCache()
+
+    private void TrimCache()
     {
-        if (MessageCache.Count > 2000)
-        {
-            var oldestKeys = MessageCache.Values
-                .OrderBy(m => m.Timestamp)
-                .Take(200)
-                .Select(m => m.MessageId)
-                .ToList();
+        if (_cache.Count <= 2000) return;
 
-            foreach (var key in oldestKeys)
-            {
-                MessageCache.TryRemove(key, out _);
-            }
-        }
+        var old = _cache.Values
+            .OrderBy(m => m.At)
+            .Take(200)
+            .Select(m => m.Id);
+
+        foreach (var k in old) _cache.TryRemove(k, out _);
     }
+
+    private static string FixServer(string s) =>
+        s.StartsWith("http") ? s : "https://" + s;
+
+    private static string Esc(string s) =>
+        s.Replace("*", "\\*").Replace("_", "\\_").Replace("`", "\\`").Replace("[", "\\[");
 }
